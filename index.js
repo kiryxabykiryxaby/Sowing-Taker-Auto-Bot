@@ -7,6 +7,19 @@ const fs = require('fs');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const API_BASE_URL = 'https://sowing-api.taker.xyz';
+const CONTRACT_ADDRESS = '0xF929AB815E8BfB84Cdab8d1bb53F22eB1e455378';
+const CONTRACT_ABI = [
+    {
+        "constant": false,
+        "inputs": [],
+        "name": "active",
+        "outputs": [],
+        "payable": false,
+        "stateMutability": "nonpayable",
+        "type": "function"
+    }
+];
+
 const HEADERS = {
     'accept': 'application/json, text/plain, */*',
     'accept-language': 'en-US,en;q=0.9',
@@ -70,7 +83,7 @@ const modeBox = blessed.box({
     left: 0,
     width: '100%',
     height: 3,
-    content: `{center}CURRENT MODE: {green-fg}FARMING{/green-fg} | Wallet 1 of ${wallets.length}{/center}`,
+    content: `{center}CURRENT MODE: {green-fg}AUTO-FARMING{/green-fg} | Wallet 1 of ${wallets.length}{/center}`,
     tags: true,
     style: { fg: 'yellow', bg: 'black', border: { fg: 'white' } },
     border: { type: 'line' }
@@ -91,7 +104,7 @@ const farmingStatusBox = blessed.box({
     top: 13,
     left: 0,
     width: '100%',
-    height: 9, 
+    height: 9,
     content: 'Loading farming status...',
     tags: true,
     style: { fg: 'white', bg: 'black', border: { fg: 'white' } },
@@ -185,13 +198,14 @@ async function generateNonce(wallet) {
     const response = await apiRequest(
         `${API_BASE_URL}/wallet/generateNonce`,
         'POST',
-        { walletAddress: wallet.address },
+        { walletAddress: ethers.utils.getAddress(wallet.address) }, 
         null,
         wallet.proxy
     );
+    logMessage(`Nonce API response: ${JSON.stringify(response)}`, 'info', wallet.address); 
     if (response.code === 200) {
         if (response.result?.nonce) {
-            return response.result.nonce;
+            return response.result.nonce; 
         } else if (typeof response.result === 'string') {
             const nonceMatch = response.result.match(/Nonce: (.*)$/m);
             if (nonceMatch && nonceMatch[1]) {
@@ -203,20 +217,77 @@ async function generateNonce(wallet) {
 }
 
 async function login(wallet, nonce) {
-    const message = `Taker quest needs to verify your identity to prevent unauthorized access. Please confirm your sign-in details below:\n\naddress: ${wallet.address}\n\nNonce: ${nonce}`;
+    const checksummedAddress = ethers.utils.getAddress(wallet.address);
+
+    const message = `Taker quest needs to verify your identity to prevent unauthorized access. Please confirm your sign-in details below:\n\naddress: ${checksummedAddress}\n\nNonce: ${nonce}`;
+    
     const ethersWallet = new ethers.Wallet(wallet.privateKey);
-    const signature = await ethersWallet.signMessage(message);
+
+    logMessage(`Message to sign: ${message}`, 'info', wallet.address);
+
+    let signature;
+    try {
+        signature = await ethersWallet.signMessage(message);
+        logMessage(`Generated signature: ${signature}`, 'info', wallet.address);
+    } catch (error) {
+        logMessage(`Signature generation failed: ${error.message}`, 'error', wallet.address);
+        throw error;
+    }
+
     const response = await apiRequest(
         `${API_BASE_URL}/wallet/login`,
         'POST',
-        { address: wallet.address, signature, message },
+        { address: checksummedAddress, signature, message },
         null,
         wallet.proxy
     );
+
+    logMessage(`Login API response: ${JSON.stringify(response)}`, 'info', wallet.address); 
+
     if (response.code === 200) {
         return response.result.token;
     }
-    throw new Error('Login failed: ' + response.message);
+
+    logMessage('Standard signature failed. Attempting EIP-712 signing...', 'warning', wallet.address);
+    const domain = {
+        name: 'Taker',
+        version: '1',
+        chainId: 1125, 
+    };
+    const types = {
+        Login: [
+            { name: 'address', type: 'address' },
+            { name: 'nonce', type: 'string' },
+        ],
+    };
+    const value = {
+        address: checksummedAddress,
+        nonce: nonce,
+    };
+    
+    try {
+        signature = await ethersWallet._signTypedData(domain, types, value);
+        logMessage(`Generated EIP-712 signature: ${signature}`, 'info', wallet.address);
+    } catch (error) {
+        logMessage(`EIP-712 signature generation failed: ${error.message}`, 'error', wallet.address);
+        throw error;
+    }
+
+    const eip712Response = await apiRequest(
+        `${API_BASE_URL}/wallet/login`,
+        'POST',
+        { address: checksummedAddress, signature, message: JSON.stringify({ domain, types, value }) },
+        null,
+        wallet.proxy
+    );
+
+    logMessage(`EIP-712 login API response: ${JSON.stringify(eip712Response)}`, 'info', wallet.address);
+
+    if (eip712Response.code === 200) {
+        return eip712Response.result.token;
+    }
+
+    throw new Error('Login failed: ' + (response.message || eip712Response.message || 'Signature mismatch'));
 }
 
 async function getUserInfo(wallet, token) {
@@ -242,11 +313,100 @@ async function performSignIn(wallet, token) {
         wallet.proxy
     );
     if (response.code === 200) {
-        logMessage('Sign-in successful!', 'success', wallet.address);
+        logMessage('Sign-in successful! Started farming.', 'success', wallet.address);
         return true;
     }
     logMessage('Sign-in failed: ' + response.message, 'error', wallet.address);
     return false;
+}
+
+async function claimReward(wallet, token) {
+    try {
+        logMessage('Initiating reward claim process...', 'info', wallet.address);
+
+        logMessage('Preparing on-chain transaction...', 'info', wallet.address);
+
+        const provider = new ethers.providers.JsonRpcProvider('https://rpc-mainnet.taker.xyz', {
+            chainId: 1125,
+            name: 'Taker',
+            nativeCurrency: { name: 'Taker', symbol: 'TAKER', decimals: 18 }
+        });
+
+        const ethersWallet = new ethers.Wallet(wallet.privateKey, provider);
+
+        const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, ethersWallet);
+
+        const gasLimit = 182832;
+        const maxPriorityFeePerGas = ethers.utils.parseUnits('0.11', 'gwei');
+        const maxFeePerGas = ethers.utils.parseUnits('0.11135', 'gwei');
+
+        logMessage('Sending transaction to call active()...', 'info', wallet.address);
+        const tx = await contract.active({
+            gasLimit,
+            maxPriorityFeePerGas,
+            maxFeePerGas,
+            type: 2 
+        });
+
+        logMessage(`Transaction sent: ${tx.hash}`, 'info', wallet.address);
+        const receipt = await tx.wait();
+        logMessage(`Transaction confirmed: ${receipt.transactionHash} | Gas used: ${receipt.gasUsed}`, 'success', wallet.address);
+
+        logMessage('Calling signIn API with status=false...', 'info', wallet.address);
+        const signInResponse = await apiRequest(
+            `${API_BASE_URL}/task/signIn?status=false`,
+            'GET',
+            null,
+            token,
+            wallet.proxy
+        );
+
+        if (signInResponse.code === 200) {
+            logMessage('Sign-in API (status=false) successful.', 'success', wallet.address);
+        } else {
+            logMessage(`Sign-in API (status=false) failed: Code ${signInResponse.code} - ${signInResponse.message || 'Unknown error'}`, 'warning', wallet.address);
+        }
+
+        logMessage('Reward claimed successfully!', 'success', wallet.address);
+        return true;
+    } catch (error) {
+        logMessage(`Error in claim process: ${error.message}`, 'error', wallet.address);
+        return false;
+    }
+}
+
+async function completeAndRestartFarmingCycle(wallet, token) {
+    try {
+        const claimSuccess = await claimReward(wallet, token);
+
+        if (claimSuccess) {
+            logMessage('Starting new farming cycle...', 'info', wallet.address);
+            const signInSuccess = await performSignIn(wallet, token);
+
+            if (signInSuccess) {
+                const updatedUserInfo = await getUserInfo(wallet, token);
+
+                if (currentWalletIndex === wallets.indexOf(wallet)) {
+                    await updateUserInfo(wallet, token);
+                    await updateFarmingStatus(wallet, token);
+                }
+
+                if (updatedUserInfo.nextTimestamp && updatedUserInfo.nextTimestamp > Date.now()) {
+                    if (wallet.countdownInterval) {
+                        clearInterval(wallet.countdownInterval);
+                    }
+                    startCountdown(wallet, token, updatedUserInfo.nextTimestamp);
+                    return true;
+                }
+            }
+        }
+
+        logMessage('Failed to complete farming cycle. Will retry later.', 'warning', wallet.address);
+        return false;
+    } catch (error) {
+        logMessage('Error in farming cycle: ' + error.message, 'error', wallet.address);
+        return false;
+    }
 }
 
 function formatTimeRemaining(timestamp) {
@@ -297,7 +457,18 @@ async function updateFarmingStatus(wallet, token) {
             return;
         }
         const userInfo = await getUserInfo(wallet, token);
-        if (userInfo.nextTimestamp && userInfo.nextTimestamp > Date.now()) {
+
+        if (userInfo.nextTimestamp && userInfo.nextTimestamp <= Date.now()) {
+            farmingStatusBox.setContent(
+                `{yellow-fg}Wallet Address:{/yellow-fg} {green-fg}${wallet.address}{/green-fg}\n` +
+                `{yellow-fg}Proxy:{/yellow-fg} {green-fg}${proxyDisplay}{/green-fg}\n` +
+                `{yellow-fg}Farming Status:{/yellow-fg} {yellow-fg}COMPLETED{/yellow-fg}\n` +
+                `{yellow-fg}Action:{/yellow-fg} {yellow-fg}Automatically claiming reward and restarting...{/yellow-fg}`
+            );
+            screen.render();
+
+            await completeAndRestartFarmingCycle(wallet, token);
+        } else if (userInfo.nextTimestamp && userInfo.nextTimestamp > Date.now()) {
             farmingStatusBox.setContent(
                 `{yellow-fg}Wallet Address:{/yellow-fg} {green-fg}${wallet.address}{/green-fg}\n` +
                 `{yellow-fg}Proxy:{/yellow-fg} {green-fg}${proxyDisplay}{/green-fg}\n` +
@@ -305,13 +476,19 @@ async function updateFarmingStatus(wallet, token) {
                 `{yellow-fg}Next Farming Time:{/yellow-fg} {green-fg}${new Date(userInfo.nextTimestamp).toLocaleString()}{/green-fg}\n` +
                 `{yellow-fg}Time Remaining:{/yellow-fg} {green-fg}${formatTimeRemaining(userInfo.nextTimestamp)}{/green-fg}`
             );
+
+            if (!wallet.countdownInterval) {
+                startCountdown(wallet, token, userInfo.nextTimestamp);
+            }
         } else {
             farmingStatusBox.setContent(
                 `{yellow-fg}Wallet Address:{/yellow-fg} {green-fg}${wallet.address}{/green-fg}\n` +
                 `{yellow-fg}Proxy:{/yellow-fg} {green-fg}${proxyDisplay}{/green-fg}\n` +
                 `{yellow-fg}Farming Status:{/yellow-fg} {red-fg}INACTIVE{/red-fg}\n` +
-                `{yellow-fg}Action:{/yellow-fg} {yellow-fg}Attempting to start farming...{/yellow-fg}`
+                `{yellow-fg}Action:{/yellow-fg} {yellow-fg}Starting farming...{/yellow-fg}`
             );
+            screen.render();
+
             const signInSuccess = await performSignIn(wallet, token);
             if (signInSuccess) {
                 const updatedUserInfo = await getUserInfo(wallet, token);
@@ -322,6 +499,11 @@ async function updateFarmingStatus(wallet, token) {
                     `{yellow-fg}Next Farming Time:{/yellow-fg} {green-fg}${new Date(updatedUserInfo.nextTimestamp).toLocaleString()}{/green-fg}\n` +
                     `{yellow-fg}Time Remaining:{/yellow-fg} {green-fg}${formatTimeRemaining(updatedUserInfo.nextTimestamp)}{/green-fg}`
                 );
+
+                if (wallet.countdownInterval) {
+                    clearInterval(wallet.countdownInterval);
+                }
+                startCountdown(wallet, token, updatedUserInfo.nextTimestamp);
             }
         }
     } catch (error) {
@@ -337,17 +519,34 @@ async function updateFarmingStatus(wallet, token) {
 }
 
 function startCountdown(wallet, token, nextTimestamp) {
+    if (wallet.countdownInterval) {
+        clearInterval(wallet.countdownInterval);
+    }
+
     const updateCountdown = async () => {
         const now = Date.now();
         const timeLeft = nextTimestamp - now;
+
         if (timeLeft <= 0) {
-            logMessage('Ready to farm again!', 'success', wallet.address);
+            logMessage('Farming cycle complete!', 'success', wallet.address);
             clearInterval(wallet.countdownInterval);
+            wallet.countdownInterval = null;
+
             if (currentWalletIndex === wallets.indexOf(wallet)) {
-                await updateFarmingStatus(wallet, token);
+                const proxyDisplay = wallet.proxy ? normalizeProxy(wallet.proxy) : 'None';
+                farmingStatusBox.setContent(
+                    `{yellow-fg}Wallet Address:{/yellow-fg} {green-fg}${wallet.address}{/green-fg}\n` +
+                    `{yellow-fg}Proxy:{/yellow-fg} {green-fg}${proxyDisplay}{/green-fg}\n` +
+                    `{yellow-fg}Farming Status:{/yellow-fg} {yellow-fg}COMPLETED{/yellow-fg}\n` +
+                    `{yellow-fg}Action:{/yellow-fg} {yellow-fg}Automatically claiming reward and restarting...{/yellow-fg}`
+                );
+                screen.render();
             }
+
+            await completeAndRestartFarmingCycle(wallet, token);
             return;
         }
+
         if (currentWalletIndex === wallets.indexOf(wallet)) {
             const proxyDisplay = wallet.proxy ? normalizeProxy(wallet.proxy) : 'None';
             farmingStatusBox.setContent(
@@ -360,12 +559,13 @@ function startCountdown(wallet, token, nextTimestamp) {
             screen.render();
         }
     };
+
     updateCountdown();
     wallet.countdownInterval = setInterval(updateCountdown, 1000);
 }
 
 async function runBot() {
-    logMessage(`Starting Taker Farming Bot for ${wallets.length} wallet(s)`, 'info');
+    logMessage(`Starting Taker Auto-Farming Bot for ${wallets.length} wallet(s)`, 'info');
 
     for (const wallet of wallets) {
         try {
@@ -392,21 +592,64 @@ async function runBot() {
     for (const wallet of wallets) {
         const token = tokens[wallet.address];
         if (token) {
-            const userInfo = await getUserInfo(wallet, token);
-            if (userInfo.nextTimestamp && userInfo.nextTimestamp > Date.now()) {
-                startCountdown(wallet, token, userInfo.nextTimestamp);
+            try {
+                const userInfo = await getUserInfo(wallet, token);
+
+                if (userInfo.nextTimestamp && userInfo.nextTimestamp <= Date.now()) {
+                    logMessage('Farming cycle already complete. Claiming and restarting...', 'info', wallet.address);
+                    await completeAndRestartFarmingCycle(wallet, token);
+                } else if (userInfo.nextTimestamp && userInfo.nextTimestamp > Date.now()) {
+                    logMessage(`Farming in progress. Next claim in: ${formatTimeRemaining(userInfo.nextTimestamp)}`, 'info', wallet.address);
+                    startCountdown(wallet, token, userInfo.nextTimestamp);
+                } else {
+                    logMessage('No active farming detected. Starting farming...', 'info', wallet.address);
+                    const signInSuccess = await performSignIn(wallet, token);
+                    if (signInSuccess) {
+                        const updatedInfo = await getUserInfo(wallet, token);
+                        if (updatedInfo.nextTimestamp) {
+                            startCountdown(wallet, token, updatedInfo.nextTimestamp);
+                        }
+                    }
+                }
+            } catch (error) {
+                logMessage('Error setting up farming: ' + error.message, 'error', wallet.address);
             }
         }
     }
 
+    const farmingCheckInterval = setInterval(async () => {
+        for (const wallet of wallets) {
+            const token = tokens[wallet.address];
+            if (token) {
+                try {
+                    const userInfo = await getUserInfo(wallet, token);
+
+                    if (userInfo.nextTimestamp && userInfo.nextTimestamp <= Date.now() && !wallet.countdownInterval) {
+                        logMessage('Detected completed farming cycle. Processing...', 'info', wallet.address);
+                        await completeAndRestartFarmingCycle(wallet, token);
+                    } else if (!userInfo.nextTimestamp) {
+                        logMessage('No active farming detected. Starting farming...', 'info', wallet.address);
+                        await performSignIn(wallet, token);
+                    }
+                } catch (error) {
+                    logMessage('Error in farming check: ' + error.message, 'error', wallet.address);
+                }
+            }
+        }
+    }, 30000);
+
     const refreshInterval = setInterval(async () => {
         const wallet = wallets[currentWalletIndex];
-        await updateUserInfo(wallet, tokens[wallet.address]);
-        await updateFarmingStatus(wallet, tokens[wallet.address]);
+        const token = tokens[wallet.address];
+        if (token) {
+            await updateUserInfo(wallet, token);
+            await updateFarmingStatus(wallet, token);
+        }
     }, 30000);
 
     screen.key(['q', 'C-c'], () => {
         clearInterval(refreshInterval);
+        clearInterval(farmingCheckInterval);
         wallets.forEach(wallet => {
             if (wallet.countdownInterval) clearInterval(wallet.countdownInterval);
         });
@@ -437,7 +680,7 @@ async function runBot() {
     screen.key(['left', 'h'], () => {
         currentWalletIndex = (currentWalletIndex - 1 + wallets.length) % wallets.length;
         const wallet = wallets[currentWalletIndex];
-        modeBox.setContent(`{center}CURRENT MODE: {green-fg}FARMING{/green-fg} | Wallet ${currentWalletIndex + 1} of ${wallets.length}{/center}`);
+        modeBox.setContent(`{center}CURRENT MODE: {green-fg}AUTO-FARMING{/green-fg} | Wallet ${currentWalletIndex + 1} of ${wallets.length}{/center}`);
         updateUserInfo(wallet, tokens[wallet.address]);
         updateFarmingStatus(wallet, tokens[wallet.address]);
     });
@@ -445,7 +688,7 @@ async function runBot() {
     screen.key(['right', 'l'], () => {
         currentWalletIndex = (currentWalletIndex + 1) % wallets.length;
         const wallet = wallets[currentWalletIndex];
-        modeBox.setContent(`{center}CURRENT MODE: {green-fg}FARMING{/green-fg} | Wallet ${currentWalletIndex + 1} of ${wallets.length}{/center}`);
+        modeBox.setContent(`{center}CURRENT MODE: {green-fg}AUTO-FARMING{/green-fg} | Wallet ${currentWalletIndex + 1} of ${wallets.length}{/center}`);
         updateUserInfo(wallet, tokens[wallet.address]);
         updateFarmingStatus(wallet, tokens[wallet.address]);
     });
