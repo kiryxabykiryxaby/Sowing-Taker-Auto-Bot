@@ -2,9 +2,20 @@ require('dotenv').config();
 const axios = require('axios');
 const { ethers } = require('ethers');
 const blessed = require('blessed');
-const colors = require('colors');
+const { Signale } = require('signale');
 const fs = require('fs');
 const { HttpsProxyAgent } = require('https-proxy-agent');
+
+// Configure Signale logger with custom "retrying" type
+const logger = new Signale({
+    types: {
+        retrying: {
+            badge: '↻',
+            color: 'blue',
+            label: 'retry'
+        }
+    }
+});
 
 const API_BASE_URL = 'https://sowing-api.taker.xyz';
 const CONTRACT_ADDRESS = '0xF929AB815E8BfB84Cdab8d1bb53F22eB1e455378';
@@ -165,21 +176,27 @@ function logMessage(message, type = 'info', walletAddress = '') {
     const timestamp = new Date().toLocaleTimeString();
     const prefix = walletAddress ? `[${walletAddress.slice(0, 6)}...${walletAddress.slice(-4)}] ` : '';
     let coloredMessage;
+    const formatted = `[${timestamp}] ${prefix}${message}`;
     switch (type) {
         case 'error':
-            coloredMessage = `{red-fg}[${timestamp}] ${prefix}${message}{/red-fg}`;
+            coloredMessage = `{red-fg}${formatted}{/red-fg}`;
+            logger.error(formatted);
             break;
         case 'success':
-            coloredMessage = `{green-fg}[${timestamp}] ${prefix}${message}{/green-fg}`;
+            coloredMessage = `{green-fg}${formatted}{/green-fg}`;
+            logger.success(formatted);
             break;
         case 'warning':
-            coloredMessage = `{yellow-fg}[${timestamp}] ${prefix}${message}{/yellow-fg}`;
+            coloredMessage = `{yellow-fg}${formatted}{/yellow-fg}`;
+            logger.warn(formatted);
             break;
         case 'retrying':
-            coloredMessage = `{blue-fg}[${timestamp}] ${prefix}${message}{/blue-fg}`;
+            coloredMessage = `{blue-fg}${formatted}{/blue-fg}`;
+            logger.retrying(formatted);
             break;
         default:
-            coloredMessage = `{white-fg}[${timestamp}] ${prefix}${message}{/white-fg}`;
+            coloredMessage = `{white-fg}${formatted}{/white-fg}`;
+            logger.info(formatted);
     }
     logBox.log(coloredMessage);
     screen.render();
